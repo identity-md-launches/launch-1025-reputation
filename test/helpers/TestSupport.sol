@@ -12,6 +12,14 @@ interface Vm {
 abstract contract TestSupport {
     Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
+    /// @dev Inclusive bounds without discarded fuzz cases; already valid inputs keep their value.
+    function bound(uint256 value, uint256 minimum, uint256 maximum) internal pure returns (uint256) {
+        require(minimum <= maximum, "invalid bounds");
+        if (value >= minimum && value <= maximum) return value;
+        // A full-width range returns above, so this addition cannot overflow.
+        return minimum + value % (maximum - minimum + 1);
+    }
+
     function assertEq(uint256 actual, uint256 expected) internal pure {
         require(actual == expected, "uint mismatch");
     }
