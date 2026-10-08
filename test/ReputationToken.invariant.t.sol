@@ -5,28 +5,28 @@ import {ReputationToken} from "../src/ReputationToken.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {TestSupport} from "./helpers/TestSupport.sol";
 
-/// @dev An independent balance/allowance model across four actors and randomized action sequences.
+/// @dev An independent balance, burn, allowance and admin model across randomized sequences.
 contract ReputationHandler is TestSupport {
     uint256 internal constant SUPPLY = 1_000_000_000 * 10 ** 18;
     ReputationToken public immutable token;
     address[4] public actors = [address(0x1001), address(0x1002), address(0x1003), address(0x1004)];
     mapping(address => uint256) public expectedBalance;
     mapping(address => mapping(address => uint256)) public expectedAllowance;
+    uint256 public expectedBurned = SUPPLY / 200;
+    uint256 public expectedFeeBps = 50;
+    bool public expectedPaused;
 
     constructor() {
         token = new ReputationToken();
         assertTrue(token.transfer(actors[0], SUPPLY));
-        expectedBalance[actors[0]] = SUPPLY;
+        expectedBalance[actors[0]] = SUPPLY - expectedBurned;
     }
 
     function transfer(uint256 fromSeed, uint256 toSeed, uint256 amountSeed) external {
         address from = actors[fromSeed % 4];
         address to = actors[toSeed % 4];
         uint256 amount = _amount(amountSeed, expectedBalance[from]);
-        vm.prank(from);
-        assertTrue(token.transfer(to, amount));
-        expectedBalance[from] -= amount;
-        expectedBalance[to] += amount;
+        _transfer(from, to, amount);
     }
 
     function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amountSeed) external {
@@ -46,11 +46,16 @@ contract ReputationHandler is TestSupport {
         uint256 approved = expectedAllowance[from][spender];
         uint256 limit = expectedBalance[from] < approved ? expectedBalance[from] : approved;
         uint256 amount = _amount(amountSeed, limit);
+        if (expectedPaused) {
+            vm.expectRevert(abi.encodeWithSelector(ReputationToken.EnforcedPause.selector));
+            vm.prank(spender);
+            token.transferFrom(from, to, amount);
+            return;
+        }
         vm.prank(spender);
         assertTrue(token.transferFrom(from, to, amount));
         if (approved != type(uint256).max) expectedAllowance[from][spender] -= amount;
-        expectedBalance[from] -= amount;
-        expectedBalance[to] += amount;
+        _move(from, to, amount);
     }
 
     // Expected failures are caught explicitly. They must leave the model unchanged, and any
@@ -60,7 +65,7 @@ contract ReputationHandler is TestSupport {
         address to = actors[toSeed % 4];
         uint256 balance = expectedBalance[from];
         uint256 amount = bound(amountSeed, balance + 1, type(uint256).max);
-        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, balance, amount));
+        _expectBalanceFailure(from, balance, amount);
         vm.prank(from);
         token.transfer(to, amount);
     }
@@ -112,7 +117,7 @@ contract ReputationHandler is TestSupport {
         uint256 balance = expectedBalance[from];
         uint256 amount = bound(amountSeed, balance + 1, type(uint256).max);
         _approve(from, spender, infinite ? type(uint256).max : amount);
-        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, balance, amount));
+        _expectBalanceFailure(from, balance, amount);
         vm.prank(spender);
         token.transferFrom(from, to, amount);
     }
@@ -141,14 +146,81 @@ contract ReputationHandler is TestSupport {
         address from = actors[fromIndex];
         address to = actors[(fromIndex + 1 + toSeed % 3) % 4];
         uint256 amount = _amount(amountSeed, expectedBalance[from]);
+        uint256 received = amount - _fee(amount);
+        _transfer(from, to, amount);
+        // Check the outward leg too: a broken transfer must not be hidden by its inverse.
+        assertEq(token.balanceOf(from), expectedBalance[from]);
+        assertEq(token.balanceOf(to), expectedBalance[to]);
+        if (!expectedPaused) _transfer(to, from, received);
+    }
+
+    function setFee(uint256 seed) external {
+        uint256 choice = seed % 4;
+        uint256 rate = choice == 0 ? 0 : choice == 1 ? 50 : choice == 2 ? 10_000 : seed % 10_001;
+        token.setFeeBps(rate);
+        expectedFeeBps = rate;
+    }
+
+    function setInvalidFee(uint256 seed) external {
+        uint256 rate = bound(seed, 10_001, type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(ReputationToken.InvalidFee.selector, rate));
+        token.setFeeBps(rate);
+    }
+
+    function setPaused(bool nextPaused) external {
+        if (nextPaused == expectedPaused) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    nextPaused ? ReputationToken.EnforcedPause.selector : ReputationToken.ExpectedPause.selector
+                )
+            );
+        }
+        if (nextPaused) token.pause();
+        else token.unpause();
+        expectedPaused = nextPaused;
+    }
+
+    function unauthorizedAdministration(uint256 actorSeed, uint256 rate, uint256 actionSeed) external {
+        address actor = actors[actorSeed % 4];
+        vm.expectRevert(abi.encodeWithSelector(ReputationToken.UnauthorizedOwner.selector, actor));
+        vm.prank(actor);
+        if (actionSeed % 4 == 0) token.setFeeBps(rate);
+        else if (actionSeed % 4 == 1) token.pause();
+        else if (actionSeed % 4 == 2) token.unpause();
+        else token.transferOwnership(actor);
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        if (expectedPaused) {
+            vm.expectRevert(abi.encodeWithSelector(ReputationToken.EnforcedPause.selector));
+            vm.prank(from);
+            token.transfer(to, amount);
+            return;
+        }
         vm.prank(from);
         assertTrue(token.transfer(to, amount));
-        // Check the outward leg too: a broken transfer must not be hidden by its inverse.
-        assertEq(token.balanceOf(from), expectedBalance[from] - amount);
-        assertEq(token.balanceOf(to), expectedBalance[to] + amount);
-        vm.prank(to);
-        assertTrue(token.transfer(from, amount));
-        // No model updates: a fee-free round trip restores every balance and allowance.
+        _move(from, to, amount);
+    }
+
+    function _move(address from, address to, uint256 amount) internal {
+        uint256 burned = _fee(amount);
+        expectedBalance[from] -= amount;
+        expectedBalance[to] += amount - burned;
+        expectedBurned += burned;
+    }
+
+    function _fee(uint256 amount) internal view returns (uint256) {
+        return (amount / 10_000) * expectedFeeBps + ((amount % 10_000) * expectedFeeBps) / 10_000;
+    }
+
+    function _expectBalanceFailure(address from, uint256 balance, uint256 amount) internal {
+        if (expectedPaused) {
+            vm.expectRevert(abi.encodeWithSelector(ReputationToken.EnforcedPause.selector));
+        } else {
+            vm.expectRevert(
+                abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, balance, amount)
+            );
+        }
     }
 
     function _approve(address owner, address spender, uint256 amount) internal {
@@ -193,7 +265,7 @@ contract ReputationTokenInvariantTest is TestSupport {
             assertEq(balance, handler.expectedBalance(actor));
             sum += balance;
         }
-        assertEq(sum, 1_000_000_000 * 10 ** 18);
+        assertEq(sum + handler.expectedBurned(), 1_000_000_000 * 10 ** 18);
         assertEq(token.totalSupply(), sum);
         assertEq(token.balanceOf(address(0)), 0);
         assertEq(token.balanceOf(address(handler)), 0);
@@ -216,5 +288,12 @@ contract ReputationTokenInvariantTest is TestSupport {
         assertEq(token.symbol(), "REP");
         assertEq(token.decimals(), 18);
         assertEq(token.INITIAL_SUPPLY(), 1_000_000_000 * 10 ** 18);
+    }
+
+    function invariant_administrationMatchesModel() public view {
+        assertEq(token.feeBps(), handler.expectedFeeBps());
+        assertTrue(token.paused() == handler.expectedPaused());
+        assertTrue(token.owner() == address(handler));
+        assertTrue(token.pendingOwner() == address(0));
     }
 }

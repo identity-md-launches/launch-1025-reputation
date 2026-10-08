@@ -183,10 +183,11 @@ contract ReputationTokenAdversarialTest is TestSupport {
     function testFuzz_transferFromInsufficientBalanceIsAtomic(uint256 balanceSeed, uint256 amountSeed, bool infinite)
         public
     {
-        uint256 balance = bound(balanceSeed, 0, SUPPLY);
+        uint256 funding = bound(balanceSeed, 0, SUPPLY);
+        uint256 balance = funding - funding / 200;
         uint256 amount = bound(amountSeed, balance + 1, type(uint256).max);
         uint256 approved = infinite ? type(uint256).max : amount;
-        assertTrue(token.transfer(ALICE, balance));
+        assertTrue(token.transfer(ALICE, funding));
         vm.prank(ALICE);
         assertTrue(token.approve(SPENDER, approved));
         vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, ALICE, balance, amount));
@@ -196,8 +197,8 @@ contract ReputationTokenAdversarialTest is TestSupport {
         assertEq(token.balanceOf(ALICE), balance);
         assertEq(token.balanceOf(BOB), 0);
         assertEq(token.balanceOf(SPENDER), 0);
-        assertEq(token.balanceOf(address(this)), SUPPLY - balance);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.balanceOf(address(this)), SUPPLY - funding);
+        assertEq(token.totalSupply(), SUPPLY - funding / 200);
     }
 
     function testFuzz_approvalOverwriteIsExactAndIdempotent(uint256 initial, uint256 replacement) public {
@@ -226,7 +227,8 @@ contract ReputationTokenAdversarialTest is TestSupport {
         assertTrue(token.approve(SPENDER, aliceApproval));
         vm.prank(BOB);
         assertTrue(token.approve(SPENDER, bobApproval));
-        uint256 limit = aliceApproval < SUPPLY / 2 ? aliceApproval : SUPPLY / 2;
+        uint256 fundedBalance = SUPPLY / 2 - SUPPLY / 400;
+        uint256 limit = aliceApproval < fundedBalance ? aliceApproval : fundedBalance;
         uint256 amount = bound(amountSeed, 0, limit);
         vm.prank(SPENDER);
         assertTrue(token.transferFrom(ALICE, SPENDER, amount));
@@ -234,27 +236,33 @@ contract ReputationTokenAdversarialTest is TestSupport {
             token.allowance(ALICE, SPENDER), aliceApproval == type(uint256).max ? aliceApproval : aliceApproval - amount
         );
         assertEq(token.allowance(BOB, SPENDER), bobApproval);
-        assertEq(token.balanceOf(ALICE), SUPPLY / 2 - amount);
-        assertEq(token.balanceOf(BOB), SUPPLY / 2);
-        assertEq(token.balanceOf(SPENDER), amount);
+        assertEq(token.balanceOf(ALICE), fundedBalance - amount);
+        assertEq(token.balanceOf(BOB), fundedBalance);
+        assertEq(token.balanceOf(SPENDER), amount - amount / 200);
         assertEq(token.balanceOf(address(this)), 0);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.totalSupply(), SUPPLY - SUPPLY / 200 - amount / 200);
     }
 
-    function testFuzz_delegatedRoundTripRestoresBalancesButConsumesFiniteApproval(uint256 amountSeed) public {
+    function testFuzz_delegatedRoundTripBurnsEachLegAndConsumesGrossApproval(uint256 amountSeed) public {
         uint256 amount = bound(amountSeed, 0, SUPPLY);
         assertTrue(token.approve(SPENDER, amount));
         vm.prank(SPENDER);
         assertTrue(token.transferFrom(address(this), ALICE, amount));
-        assertEq(token.balanceOf(ALICE), amount);
+        uint256 firstBurn = amount / 200;
+        uint256 received = amount - firstBurn;
+        uint256 secondBurn = received / 200;
+        assertEq(token.balanceOf(ALICE), received);
         assertEq(token.balanceOf(address(this)), SUPPLY - amount);
         vm.prank(ALICE);
-        assertTrue(token.approve(SPENDER, amount));
+        assertTrue(token.approve(SPENDER, received));
         vm.prank(SPENDER);
-        assertTrue(token.transferFrom(ALICE, address(this), amount));
+        assertTrue(token.transferFrom(ALICE, address(this), received));
         assertEq(token.allowance(address(this), SPENDER), 0);
         assertEq(token.allowance(ALICE, SPENDER), 0);
-        _assertUnspentSupply();
+        assertEq(token.balanceOf(address(this)), SUPPLY - firstBurn - secondBurn);
+        assertEq(token.balanceOf(ALICE), 0);
+        assertEq(token.balanceOf(SPENDER), 0);
+        assertEq(token.totalSupply(), SUPPLY - firstBurn - secondBurn);
     }
 
     function _assertUnspentSupply() internal view {

@@ -34,6 +34,9 @@ contract ReputationTokenTest is TestSupport {
         assertEq(token.balanceOf(address(this)), SUPPLY);
         assertEq(token.balanceOf(ALICE), 0);
         assertEq(token.balanceOf(address(0)), 0);
+        assertTrue(token.owner() == address(this));
+        assertEq(token.feeBps(), 50);
+        assertTrue(!token.paused());
     }
 
     function test_constructorEmitsMintEvent() public {
@@ -48,21 +51,26 @@ contract ReputationTokenTest is TestSupport {
         assertEq(deployed.balanceOf(address(factory)), SUPPLY);
         assertEq(deployed.balanceOf(address(this)), 0);
         assertEq(deployed.totalSupply(), SUPPLY);
+        assertTrue(deployed.owner() == address(factory));
     }
 
-    function test_transferDeliversExactAmountAndEmitsEvent() public {
+    function test_transferBurnsHalfPercentAndEmitsBothEvents() public {
         vm.expectEmit(true, true, false, true, address(token));
-        emit Transfer(address(this), ALICE, 25 ether);
+        emit Transfer(address(this), address(0), 0.125 ether);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit Transfer(address(this), ALICE, 24.875 ether);
         assertTrue(token.transfer(ALICE, 25 ether));
         assertEq(token.balanceOf(address(this)), SUPPLY - 25 ether);
-        assertEq(token.balanceOf(ALICE), 25 ether);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.balanceOf(ALICE), 24.875 ether);
+        assertEq(token.totalSupply(), SUPPLY - 0.125 ether);
+        assertEq(token.balanceOf(address(0)), 0);
     }
 
     function test_transferEntireBalance() public {
         assertTrue(token.transfer(ALICE, SUPPLY));
         assertEq(token.balanceOf(address(this)), 0);
-        assertEq(token.balanceOf(ALICE), SUPPLY);
+        assertEq(token.balanceOf(ALICE), SUPPLY - SUPPLY / 200);
+        assertEq(token.totalSupply(), SUPPLY - SUPPLY / 200);
     }
 
     function test_zeroTransferFromEmptyAccountEmitsEvent() public {
@@ -74,10 +82,10 @@ contract ReputationTokenTest is TestSupport {
         assertEq(token.balanceOf(BOB), 0);
     }
 
-    function test_selfTransferPreservesBalance() public {
+    function test_selfTransferBurnsFee() public {
         assertTrue(token.transfer(address(this), SUPPLY));
-        assertEq(token.balanceOf(address(this)), SUPPLY);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.balanceOf(address(this)), SUPPLY - SUPPLY / 200);
+        assertEq(token.totalSupply(), SUPPLY - SUPPLY / 200);
     }
 
     function test_transferToZeroReverts() public {
@@ -130,15 +138,19 @@ contract ReputationTokenTest is TestSupport {
     function test_transferFromSpendsAllowanceAndEmitsTransfer() public {
         assertTrue(token.approve(SPENDER, 50 ether));
         vm.expectEmit(true, true, false, true, address(token));
-        emit Transfer(address(this), ALICE, 20 ether);
+        emit Transfer(address(this), address(0), 0.1 ether);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit Transfer(address(this), ALICE, 19.9 ether);
         vm.prank(SPENDER);
         assertTrue(token.transferFrom(address(this), ALICE, 20 ether));
         assertEq(token.allowance(address(this), SPENDER), 30 ether);
         assertEq(token.balanceOf(address(this)), SUPPLY - 20 ether);
-        assertEq(token.balanceOf(ALICE), 20 ether);
+        assertEq(token.balanceOf(ALICE), 19.9 ether);
         vm.prank(SPENDER);
         assertTrue(token.transferFrom(address(this), ALICE, 30 ether));
         assertEq(token.allowance(address(this), SPENDER), 0);
+        assertEq(token.balanceOf(ALICE), 49.75 ether);
+        assertEq(token.totalSupply(), SUPPLY - 0.25 ether);
     }
 
     function test_transferFromInfiniteAllowanceIsNotDecremented() public {
@@ -146,14 +158,16 @@ contract ReputationTokenTest is TestSupport {
         vm.prank(SPENDER);
         assertTrue(token.transferFrom(address(this), ALICE, SUPPLY));
         assertEq(token.allowance(address(this), SPENDER), type(uint256).max);
-        assertEq(token.balanceOf(ALICE), SUPPLY);
+        assertEq(token.balanceOf(ALICE), SUPPLY - SUPPLY / 200);
+        assertEq(token.totalSupply(), SUPPLY - SUPPLY / 200);
     }
 
     function test_transferFromSelfStillSpendsAllowance() public {
-        assertTrue(token.approve(SPENDER, 9));
+        assertTrue(token.approve(SPENDER, 1 ether));
         vm.prank(SPENDER);
-        assertTrue(token.transferFrom(address(this), address(this), 9));
-        assertEq(token.balanceOf(address(this)), SUPPLY);
+        assertTrue(token.transferFrom(address(this), address(this), 1 ether));
+        assertEq(token.balanceOf(address(this)), SUPPLY - 0.005 ether);
+        assertEq(token.totalSupply(), SUPPLY - 0.005 ether);
         assertEq(token.allowance(address(this), SPENDER), 0);
     }
 
@@ -218,42 +232,42 @@ contract ReputationTokenTest is TestSupport {
         assertEq(token.totalSupply(), SUPPLY);
     }
 
-    function test_distributionAndPoolStyleTransferPathsDeliverInFull() public {
+    function test_distributionAndPoolStyleTransferPathsAllBurn() public {
         // These accounts model transfer legs only, not a live pool or distributor implementation.
         address distributor = address(0xD157);
         address pool = address(0x9001);
         uint256 share = SUPPLY / 10;
         assertTrue(token.transfer(distributor, share));
+        uint256 fundedShare = share - share / 200;
         vm.prank(distributor);
-        assertTrue(token.transfer(ALICE, share));
-        assertEq(token.balanceOf(ALICE), share);
+        assertTrue(token.transfer(ALICE, fundedShare));
+        assertEq(token.balanceOf(ALICE), fundedShare - fundedShare / 200);
         assertEq(token.balanceOf(distributor), 0);
         assertTrue(token.transfer(pool, share));
         vm.prank(pool);
         assertTrue(token.transfer(BOB, 100 ether));
-        assertEq(token.balanceOf(BOB), 100 ether);
+        assertEq(token.balanceOf(BOB), 99.5 ether);
         vm.prank(BOB);
-        assertTrue(token.transfer(pool, 100 ether));
-        assertEq(token.balanceOf(pool), share);
+        assertTrue(token.transfer(pool, 99.5 ether));
+        assertEq(token.balanceOf(pool), fundedShare - 0.9975 ether);
         assertEq(token.balanceOf(BOB), 0);
         assertTrue(token.transfer(BOB, SUPPLY - 2 * share));
-        assertEq(token.balanceOf(BOB), SUPPLY - 2 * share);
+        assertEq(token.balanceOf(BOB), (SUPPLY - 2 * share) * 199 / 200);
         assertEq(token.balanceOf(address(this)), 0);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.totalSupply(), SUPPLY - SUPPLY / 200 - fundedShare / 200 - 0.9975 ether);
+        assertEq(token.totalSupply(), token.balanceOf(ALICE) + token.balanceOf(BOB) + token.balanceOf(pool));
     }
 
-    function test_mintAndAdministrativeEntrypointsAreAbsent() public {
+    function test_mintSeizureAndUpgradeEntrypointsAreAbsent() public {
         assertTrue(token.transfer(ALICE, 100));
-        bytes[12] memory calls = [
+        bytes[10] memory calls = [
             abi.encodeWithSignature("mint(address,uint256)", BOB, 1),
             abi.encodeWithSignature("mint(uint256)", 1),
             abi.encodeWithSignature("mint()"),
             abi.encodeWithSignature("issue(uint256)", 1),
             abi.encodeWithSignature("initialize(address)", BOB),
             abi.encodeWithSignature("setMinter(address)", BOB),
-            abi.encodeWithSignature("transferOwnership(address)", BOB),
             abi.encodeWithSignature("upgradeTo(address)", BOB),
-            abi.encodeWithSignature("pause()"),
             abi.encodeWithSignature("blacklist(address)", ALICE),
             abi.encodeWithSignature("burnFrom(address,uint256)", ALICE, 1),
             abi.encodeWithSignature("seize(address)", ALICE)
@@ -286,16 +300,19 @@ contract ReputationTokenTest is TestSupport {
         }
     }
 
-    function testFuzz_transfersConserveSupply(uint256 seed) public {
+    function testFuzz_transfersConserveBalancesAndBurnedSupply(uint256 seed) public {
         uint256 amount = seed % (SUPPLY + 1);
         assertTrue(token.transfer(ALICE, amount));
-        assertEq(token.balanceOf(ALICE), amount);
+        uint256 firstBurn = amount / 200;
+        uint256 received = amount - firstBurn;
+        uint256 secondBurn = received / 200;
+        assertEq(token.balanceOf(ALICE), received);
         vm.prank(ALICE);
-        assertTrue(token.transfer(BOB, amount));
+        assertTrue(token.transfer(BOB, received));
         assertEq(token.balanceOf(ALICE), 0);
-        assertEq(token.balanceOf(BOB), amount);
-        assertEq(token.balanceOf(address(this)) + token.balanceOf(BOB), SUPPLY);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.balanceOf(BOB), received - secondBurn);
+        assertEq(token.balanceOf(address(this)) + token.balanceOf(BOB), SUPPLY - firstBurn - secondBurn);
+        assertEq(token.totalSupply(), SUPPLY - firstBurn - secondBurn);
     }
 
     function testFuzz_finiteAllowanceAccounting(uint256 approvalSeed, uint256 spendSeed) public {
@@ -305,9 +322,9 @@ contract ReputationTokenTest is TestSupport {
         vm.prank(SPENDER);
         assertTrue(token.transferFrom(address(this), ALICE, spent));
         assertEq(token.allowance(address(this), SPENDER), approved - spent);
-        assertEq(token.balanceOf(ALICE), spent);
+        assertEq(token.balanceOf(ALICE), spent - spent / 200);
         assertEq(token.balanceOf(address(this)), SUPPLY - spent);
-        assertEq(token.totalSupply(), SUPPLY);
+        assertEq(token.totalSupply(), SUPPLY - spent / 200);
     }
 
     function testFuzz_insufficientBalanceIsAtomic(uint256 seed) public {
